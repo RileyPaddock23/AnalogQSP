@@ -84,4 +84,28 @@ def test_curve( H : np.ndarray  , omega : Callable[[float], float] , interval : 
     return operators, errors
 
 
+def test_fidelity( H : np.ndarray, omega : Callable[[float], float], interval : np.ndarray, expected_unitary: np.ndarray ):
+    assert len(H.shape) == 2 and H.shape[0] == H.shape[1]
+    dU_shape = 2 * H.shape[0]
+    assert len(expected_unitary.shape) == 2 and expected_unitary.shape == (dU_shape, dU_shape)
+
+    t0, tf = interval 
+    X = np.asarray([ [0, 1], [1, 0] ])
+    Y = np.asarray([ [0, -1j], [1j, 0] ])
+    Z = np.asarray([ [1, 0], [0, -1] ])
+
+    omega_integral : OdeSolution = solve_ivp( lambda t, y: omega(t), (t0, tf), [0.0], 'DOP853', dense_output=True ).sol
+
+
+    def ode(time: float, unitary_flat: np.ndarray):
+        unitary = unitary_flat.reshape((dU_shape, dU_shape))
+        omega_integral_value = omega_integral(time)[0]
+        curve_component = np.cos(2 * omega_integral_value) * Z + np.sin(2 * omega_integral_value) * Y
+        dU = -1j * np.kron(H, curve_component) @ unitary
+        return dU.reshape(-1)
+
+    U_T = solve_ivp( ode, (t0, tf), np.eye( dU_shape, dtype=complex ).reshape(-1), 'DOP853', t_eval=[tf] ).y[..., 0].reshape((dU_shape, dU_shape))
+
+    fidelity = np.abs(np.trace( U_T @ expected_unitary.conj().T )**2) / dU_shape**2
     
+    return fidelity
