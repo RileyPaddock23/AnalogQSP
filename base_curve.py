@@ -1,16 +1,14 @@
 import torch
 import torch.nn as nn
 from torchdiffeq import odeint_adjoint
-from torchquad.integration.monte_carlo import MonteCarlo
-from torchquad.integration.simpson import Simpson
 import matplotlib.pyplot as plt
 from tqdm import trange
+from magnus import MagnusODE
 
 from abc import ABCMeta, abstractmethod
 import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
-
 def _cumtrapz(y, dt):
     return torch.cat(
         [torch.zeros_like(y[:1]), torch.cumsum(0.5 * (y[1:] + y[:-1]) * dt, dim=0)],
@@ -48,7 +46,7 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
         out = self.curve(t)
         if out.shape[-1] != 3: raise ValueError("curve output should be R^3, i.e. last dim should be 3")
         return out
-    
+
     def curvature(self, t: torch.Tensor, eps = 1e-8) -> torch.Tensor:
         v = self.curve_d1(t)
         a = self.curve_d2(t)
@@ -59,87 +57,39 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
         denom = torch.linalg.norm(v, dim=-1) ** 3
 
         return num / (denom + eps)
-    
+
     def max_curvature(self, samples = 4096):
         return self.curvature( torch.linspace(self.interval[0], self.interval[1], samples) ).max()
-    
+
     def soft_max_curvature(self, samples = 4096, strength = 32):
         k = self.curvature( torch.rand( samples ) )
         return torch.logsumexp(k * strength, dim=0) / strength
 
-    def magnus_first_order(self):
-        return self(self.interval[1]) - self(self.interval[0])
+    def magnus(self, K):
+        #Build ODE system to find K Magnus terms at time T
+        ode = MagnusODE(self, K)
+        X0 = torch.zeros(3*K)
 
-    def magnus_second_order(self, integrator_cls=Simpson, samples=8192):
-        t0, t1 = self.interval
+        t = torch.linspace(0.0, self.interval[1], steps=2)
 
-        def f(t): return torch.linalg.cross(self.curve_d1(t), self.curve(t))
+        #We only care about evaluating at the final time T which by FToC means
+        #we only need to evaluate each Omega_n at time 0 and time T
+        XT = odeint_adjoint(ode, X0, t)[-1]
 
-        integrator = integrator_cls()
-        return integrator.integrate( f, dim=1, N=samples, integration_domain=[[t0, t1]] )
-    
-    def magnus_third_order(self, samples=8192):
-        t0, t1 = self.interval
-
-        t = torch.linspace(t0, t1, samples)
-
-        r = self.curve(t)
-        rp = self.curve_d1(t)
-
-        inner = torch.linalg.cross(rp, r)
-
-        dt = (t1 - t0) / (samples - 1)
-        A = torch.cumsum(inner, dim=0) * dt
-
-        outer = torch.linalg.cross(A, rp)
-
-        term1 = torch.sum(outer, dim=0) * dt
-
-        corr = torch.linalg.cross(r, torch.linalg.cross(r, rp))
-        term2 = torch.sum(corr, dim=0) * dt
-
-        return term1 - (2.0 / 3.0) * term2
-    
-    def magnus_fourth_order(self, samples=8192, return_curve=False):
-        t0, t1 = self.interval
-        t = torch.linspace(t0, t1, samples)
-        dt = (t1 - t0) / (samples - 1)
-
-        r = self.curve(t)      
-        T = self.curve_d1(t)   
-
-        u = _cumtrapz(torch.linalg.cross(T, r), dt)      
-
-        w = _cumtrapz(torch.linalg.cross(T, u), dt)        
-
-        I1 = 2.0 * _cumtrapz(torch.linalg.cross(T, w), dt)  
-        Mx = _cumtrapz(T * u[:, 0:1], dt)
-        My = _cumtrapz(T * u[:, 1:2], dt)
-        Mz = _cumtrapz(T * u[:, 2:3], dt)
-
-        S = _cumtrapz(torch.sum(T * u, dim=1, keepdim=True), dt)
-        G = _cumtrapz(torch.linalg.cross(torch.linalg.cross(r, T), u), dt)
-
-        first_term = r[:, 0:1] * Mx + r[:, 1:2] * My + r[:, 2:3] * Mz  
-        second_term = r * S                                            
-        I2 = (first_term - second_term) - G                             
-
-        K4 = I1 + I2                                                    
-
-        if return_curve: return t, K4
-        return K4[-1]
+        self.recent_magnus_terms = XT.view(K, 3)
+        return XT.view(K, 3)
 
     def make_cost_fn(self, *terms: tuple[float, Callable[['LearnableCurve', tuple], torch.Tensor]] ):
 
         def cost_fn(curve) -> torch.Tensor:
             total = 0.0
-            
+
             for weight, fn in terms: total += weight * fn(curve)
 
             return total
 
         return cost_fn
-    
+
     def optimize(
         self,
         cost_fn : Callable[ ['LearnableCurve', tuple], torch.Tensor ],
@@ -149,8 +99,8 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
         optimizer_kwargs=None,
         callback=None,
     ):
+    
         if optimizer_kwargs is None: optimizer_kwargs = {}
-
         optimizer = optimizer_cls(self.parameters(), lr=lr, **optimizer_kwargs)
 
         for step in range(steps):
@@ -166,30 +116,15 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
     # could make more efficient, too lazy
 
     def polynomial_coeffs_z(self):
-        return torch.tensor([ 
-            self.magnus_first_order().reshape(-1)[2], 
-            self.magnus_second_order().reshape(-1)[2], 
-            self.magnus_third_order()[2],
-            self.magnus_fourth_order()[2]
-        ])
+        return self.recent_magnus_terms[:,2]
 
     def polynomial_coeffs_y(self):
-        return torch.tensor([ 
-            self.magnus_first_order().reshape(-1)[1], 
-            self.magnus_second_order().reshape(-1)[1], 
-            self.magnus_third_order()[1],
-            self.magnus_fourth_order()[1]
-        ])
+        return self.recent_magnus_terms[:,1]
 
     def polynomial_coeffs_x(self):
-        return torch.tensor([ 
-            self.magnus_first_order().reshape(-1)[0], 
-            self.magnus_second_order().reshape(-1)[0], 
-            self.magnus_third_order()[0],
-            self.magnus_fourth_order()[0]
-        ])
+        return self.recent_magnus_terms[:,0]
 
-    
+
     def plot_position(self, samples: int = 1024, ax=None, show=True):
         t0, t1 = self.interval
         t = torch.linspace(t0, t1, samples, device=next(self.parameters()).device)
@@ -211,7 +146,7 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
         if show: plt.show()
 
         return ax
-    
+
     def plot_curvature(self, samples: int = 1024, ax=None, show=True):
         t0, t1 = self.interval
         t = torch.linspace(t0, t1, samples, device=next(self.parameters()).device)
@@ -230,9 +165,9 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
         return ax
 
 
-    
+
 class ArclenParameterize(LearnableCurve, metaclass=ABCMeta):
-    
+
     @abstractmethod
     def position(self, t: torch.Tensor) -> torch.Tensor:
         pass
@@ -240,7 +175,7 @@ class ArclenParameterize(LearnableCurve, metaclass=ABCMeta):
     @abstractmethod
     def velocity(self, t: torch.Tensor) -> torch.Tensor:
         pass
-    
+
     @abstractmethod
     def accel(self, t: torch.Tensor) -> torch.Tensor:
         pass
@@ -329,42 +264,39 @@ class ArclenParameterize(LearnableCurve, metaclass=ABCMeta):
 
     def curvature(self, t):
         return torch.linalg.norm(self.curve_d2(t), dim=-1)
-    
+
     def invalidate_arclen(self): self._arc_dirty = True
-    
+
 
 class CurveTester:
-    fns = [ 
-        lambda curve, _: curve.soft_max_curvature(), 
-        lambda curve, expected: torch.linalg.norm(curve.magnus_second_order() - expected),
-        lambda curve, expected: torch.linalg.norm(curve.magnus_third_order() - expected),
-        lambda curve, expected: torch.linalg.norm(curve.magnus_fourth_order() - expected)
+    fns = [
+        lambda curve, _: curve.soft_max_curvature(),
+        lambda curve, K,expected: torch.sum((curve.magnus(K) - expected)**2)
     ]
 
     def __init__(self, curve: LearnableCurve, expected_magnus_terms : torch.Tensor, weights : torch.Tensor):
-        assert len(expected_magnus_terms.shape) == 2 and expected_magnus_terms.shape[1] == 3 and expected_magnus_terms.shape[0] < 5
         assert weights.shape[0] == expected_magnus_terms.shape[0]
 
         self.curve = curve
         self.exp_mag_terms = expected_magnus_terms
+        self.K = expected_magnus_terms.shape[0]
         self.weights = weights
-    
+
     def cost(self, _):
-        terms = []
-        terms.append(self.curve.soft_max_curvature().expand(3))
-        terms.append(self.curve.magnus_second_order().squeeze(0))
-        terms.append(self.curve.magnus_third_order().squeeze(0))
-        terms.append(self.curve.magnus_fourth_order().squeeze(0))
+        # curvature = self.soft_max_curvature().expand(1)
+        magnus_terms = self.curve.magnus(self.K)
 
-        terms = torch.stack(terms[:len(self.exp_mag_terms)])
+        diffs = (magnus_terms - self.exp_mag_terms)**2
+        # terms = torch.concat((curvature, diffs))
+        # R = compute_R_terminal(curve.curve_d1, K)
 
-        diffs = torch.linalg.norm(terms - self.exp_mag_terms, dim=1)
-        return torch.dot(self.weights, diffs)
+        # loss = torch.sum((R - target_R)**2)
+        return torch.sum(diffs)
 
     def optimize(self, lr=1e-3, steps=10_000, callback=None):
 
-        self.curve.optimize(  lambda _: self.cost(_) , lr=lr, steps=steps, callback=callback )
-    
+        self.curve.optimize(lambda _: self.cost(_) , lr=lr, steps=steps, callback=callback)
+
     def poly_z(self): return [float(value) for value in self.curve.polynomial_coeffs_z()]
     def poly_y(self): return [float(value) for value in self.curve.polynomial_coeffs_y()]
     def poly_x(self): return [float(value) for value in self.curve.polynomial_coeffs_x()]
