@@ -10,43 +10,55 @@ class MagnusODE(nn.Module):
         self.curve = curve  # must implement curve_d1(t) -> (3,)
         self.K = K
         self.magnus_coeff = bernoulli(K)
+    
+    def compositions(self, n, m):
+        if m == 1:
+            yield (n,)
+            return
+        for i in range(1, n - m + 2):
+            for tail in self.compositions(n - i, m - 1):
+                yield (i,) + tail
 
     def forward(self, t, X):
         """
         X: (3*K,) flattened state
         returns dX/dt
         """
+        # def magnus_rhs_terms(R_terms, r_prime, max_order):
+        """
+        R_terms: list [R1, R2, ..., R_{k-1}]
+        r_prime: current r'(t)
+        """
+        dR = [None] * self.K
         R = X.view(self.K, 3)
 
-        rp = self.curve.curve_d1(t).squeeze(0)
+        # Order 1
+        dR[0] = self.curve.curve_d1(t)
 
-        dR_list = [rp]
+        for k in range(2, self.K+1):
 
-        # If Omega is our solution, then Omega' has a simple form
-        # (Omega_n)' = sum over {i_k} which sum to (n-1) [Omage_i_1, [Omega_i_2[...[Omega_i_k, A]...]]]
-        # So if we have i_1 = K then the remaining i_k have to sum to (n-1)-K
-        # but this is exactly (Omega_(n-1-K))
-        # Thus we get (Omega_n)' = sum_(k=1)^(n-1) [Omega_k, (Omega_(n-k))']
-        # In the curve domain we replace these commutators with cross product and get our ODE with variables Omega_n
-        for k in range(1, self.K):
-            acc = torch.zeros(3, device=X.device)
+            total = 0.0
 
-            for j in range(1, k+1):
-                coeff = self.magnus_coeff[j]/factorial(j)
-                if coeff == 0:
+            for m in range(1, k):
+
+                if self.magnus_coeff[m] == 0:
                     continue
 
-                acc = acc + coeff * torch.linalg.cross(
-                    R[j-1],
-                    dR_list[k-j] # Use previously computed dR from the list
-                )
+                coeff = self.magnus_coeff[m] / factorial(m)
 
-            dR_list.append(acc) # Add the current dR_k to the list
+                for comp in self.compositions(k-1, m):
 
-        dR = torch.stack(dR_list) # Stack all components to form the final dR tensor
+                    X = self.curve.curve_d1(t)
 
-        return dR.flatten()
+                    # apply nested ad operators
+                    for idx in reversed(comp):
+                        X = 2.0*torch.cross(R[idx-1], X)
 
+                    total = total + coeff * X
+
+            dR[k-1] = total
+
+        return dR
 
 def compute_R_terminal(curve, K, T=1.0, steps=2):
     ode = MagnusODE(curve, K)
