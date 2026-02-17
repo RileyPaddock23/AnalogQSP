@@ -68,9 +68,14 @@ class LearnableCurve(nn.Module, metaclass=ABCMeta):
     def magnus(self, K):
         #Build ODE system to find K Magnus terms at time T
         ode = MagnusODE(self, K)
-        X0 = torch.zeros(3*K)
+        tangent0 = self.curve_d1(torch.as_tensor(0.0))
+        if tangent0.ndim > 1:
+            tangent0 = tangent0.squeeze(0)
 
-        t = torch.linspace(0.0, self.interval[1], steps=2)
+        dtype = torch.complex64 if not torch.is_complex(tangent0) else tangent0.dtype
+        X0 = torch.zeros(3 * K, dtype=dtype, device=tangent0.device)
+
+        t = torch.linspace(0.0, self.interval[1], steps=2, dtype=tangent0.real.dtype, device=tangent0.device)
 
         #We only care about evaluating at the final time T which by FToC means
         #we only need to evaluate each Omega_n at time 0 and time T
